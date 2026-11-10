@@ -36,6 +36,7 @@ export const confirmInteractiveSetup = async (
   actions: readonly SetupAction[],
   accessible: boolean,
   context?: SetupConfirmationContext,
+  signal?: AbortSignal,
 ): Promise<SetupConfirmationDecision> => {
   if (context?.stage === "select" || context === undefined) {
     intro("REA setup", promptStreams);
@@ -46,7 +47,12 @@ export const confirmInteractiveSetup = async (
     renderKeyboardHelp(accessible);
   }
   if (context?.stage === "select") {
-    const selected = await selectSetupActions(actions, accessible, context);
+    const selected = await selectSetupActions(
+      actions,
+      accessible,
+      context,
+      signal,
+    );
     return selected === undefined
       ? cancelledDecision()
       : { approved: false, selectedActionIds: selected };
@@ -55,6 +61,7 @@ export const confirmInteractiveSetup = async (
   renderPreflight(actions);
   const approved = await confirm({
     ...promptStreams,
+    ...(signal === undefined ? {} : { signal }),
     message:
       actions.length === 1
         ? "Apply this change?"
@@ -82,6 +89,13 @@ export const renderSetupProgress = (event: SetupProgressEvent): void => {
   writeLine(`${symbol}  ${event.label}${suffix}`);
 };
 
+/** Show the resolved dry-run plan to a human at an interactive terminal. */
+export const renderSetupDryRun = (actions: readonly SetupAction[]): void => {
+  intro("REA setup plan", promptStreams);
+  renderPreflight(actions);
+  outro("Dry run complete. No changes were made.", promptStreams);
+};
+
 /** Finish an interactive setup journey without exposing the full doctor catalog. */
 export const renderInteractiveSetupResult = (
   result: SetupResult,
@@ -103,6 +117,8 @@ export const renderInteractiveSetupResult = (
   }
   if (result.status === "planned" || result.status === "cancelled") return;
   writeLine(`!  ${result.remediation ?? "Setup needs attention."}`);
+  for (const resource of result.cleanup?.resources ?? [])
+    writeLine(`   Pending cleanup: ${resource}`);
   outro(
     `Run \`${cliInvocation(environment)} doctor\` for the remaining checks.`,
     promptStreams,
@@ -113,14 +129,15 @@ const selectSetupActions = async (
   actions: readonly SetupAction[],
   accessible: boolean,
   context: SetupConfirmationContext,
+  signal?: AbortSignal,
 ): Promise<readonly string[] | undefined> => {
   const clientStates = context.clientStates.filter(
     ({ client }) => client.format !== "unsupported",
   );
   const initial = new Set(context.selectedClientIds);
   const selectedClientIds = accessible
-    ? await selectClientsAccessibly(clientStates, initial)
-    : await selectClients(clientStates, initial);
+    ? await selectClientsAccessibly(clientStates, initial, signal)
+    : await selectClients(clientStates, initial, signal);
   if (selectedClientIds === undefined) return undefined;
   const selectedActionIds = selectedClientIds.map(
     (id) => `configure_client:${id}`,
@@ -131,6 +148,7 @@ const selectSetupActions = async (
     else {
       const included = await confirm({
         ...promptStreams,
+        ...(signal === undefined ? {} : { signal }),
         message: "Install the guided REA skill for CLI use?",
         initialValue: false,
         vertical: accessible,
@@ -143,6 +161,7 @@ const selectSetupActions = async (
   if (hopper !== undefined) {
     const included = await confirm({
       ...promptStreams,
+      ...(signal === undefined ? {} : { signal }),
       message: "Install Hopper for deep binary analysis?",
       initialValue: false,
       vertical: accessible,
@@ -165,10 +184,12 @@ const clientHint = (state: SetupClientState): string =>
 const selectClients = async (
   states: readonly SetupClientState[],
   initial: ReadonlySet<string>,
+  signal?: AbortSignal,
 ): Promise<readonly string[] | undefined> => {
   if (states.length === 0) return [];
   const selection = await multiselect({
     ...promptStreams,
+    ...(signal === undefined ? {} : { signal }),
     message: "Which agents should use REA?",
     options: states.map((state) => ({
       value: state.client.name,
@@ -191,11 +212,13 @@ const selectClients = async (
 const selectClientsAccessibly = async (
   states: readonly SetupClientState[],
   initial: ReadonlySet<string>,
+  signal?: AbortSignal,
 ): Promise<readonly string[] | undefined> => {
   const selected: string[] = [];
   for (const state of states) {
     const included = await confirm({
       ...promptStreams,
+      ...(signal === undefined ? {} : { signal }),
       message: `Configure ${clientDisplayNames.get(state.client.name) ?? state.client.name}? ${clientHint(state)}`,
       initialValue: initial.has(state.client.name),
       vertical: true,
@@ -266,8 +289,15 @@ const readyAgentClients = (
 const readyProviders = (result: SetupResult): readonly string[] =>
   result.doctor.availableProviders.map(displayProviderId);
 
+/** Product spellings that title case would distort. Lookup ids stay lowercase. */
+const PROVIDER_DISPLAY_NAMES: Readonly<Record<string, string>> = {
+  ida: "IDA",
+  jadx: "JADX",
+};
+
 const displayProviderId = (id: string): string =>
-  id.length === 0 ? id : `${id[0]?.toUpperCase() ?? ""}${id.slice(1)}`;
+  PROVIDER_DISPLAY_NAMES[id] ??
+  (id.length === 0 ? id : `${id[0]?.toUpperCase() ?? ""}${id.slice(1)}`);
 
 const humanList = (values: readonly string[]): string => {
   if (values.length < 2) return values[0] ?? "";

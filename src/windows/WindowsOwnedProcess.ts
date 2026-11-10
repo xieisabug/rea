@@ -4,6 +4,7 @@ import { PassThrough, Writable } from "node:stream";
 import { z } from "zod";
 
 import type { ProcessCleanupResult } from "../process/ProcessOwnership.js";
+import { RuntimeControlUnavailableError } from "../process/RuntimeControlUnavailableError.js";
 import {
   requireWindowsNativeAuthority,
   windowsHandleSchema,
@@ -11,7 +12,7 @@ import {
 } from "./WindowsNativeLoader.js";
 
 const launchSchema = z.strictObject({
-  pid: z.number().int().positive().max(0xffff_ffff),
+  pid: z.int().positive().max(0xffff_ffff),
   handle: windowsHandleSchema,
   jobAssigned: z.literal(true),
   killOnOwnerClose: z.literal(true),
@@ -21,18 +22,14 @@ const pollSchema = z.strictObject({
   stderr: z.instanceof(Buffer),
   stdoutEnded: z.boolean(),
   stderrEnded: z.boolean(),
-  exitCode: z.number().int().nonnegative().max(0xffff_ffff).nullable(),
-  activeProcesses: z.number().int().nonnegative(),
+  exitCode: z.int().nonnegative().max(0xffff_ffff).nullable(),
+  activeProcesses: z.int().nonnegative(),
 });
 // A commit-limited job reports its applied limit at launch and its
 // notification state on every poll; an unlimited job reports neither.
 const limitedPollSchema = pollSchema.extend({
   memoryLimitReached: z.boolean(),
-  peakJobMemoryBytes: z
-    .number()
-    .int()
-    .nonnegative()
-    .max(Number.MAX_SAFE_INTEGER),
+  peakJobMemoryBytes: z.int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 });
 
 /** Optional native job controls for one owned Windows process tree. */
@@ -45,12 +42,152 @@ export interface WindowsOwnedProcessOptions {
   readonly authority?: WindowsNativeAuthority;
 }
 
+/** Native job control that an admitted artifact may predate. */
+export type WindowsNativeControl = "protocol-stdin" | "job-memory-limit";
+
+const NATIVE_CONTROL_NAMES: Readonly<Record<WindowsNativeControl, string>> = {
+  "protocol-stdin": "owned protocol stdin",
+  "job-memory-limit": "Job Object memory limits",
+};
+
+/** A requested launch control is absent from the admitted native artifact. */
+export class WindowsNativeControlUnavailableError extends RuntimeControlUnavailableError {
+  readonly code = "windows-native-control-unavailable";
+
+  constructor(readonly control: WindowsNativeControl) {
+    super(
+      `The bundled Windows native artifact does not support ${NATIVE_CONTROL_NAMES[control]}; use a matching current Windows x64 REA package.`,
+      {
+        remediationAction:
+          "Install the matching current Windows x64 REA package; its native inspection must prove this control. REA does not launch without it, so retrying the unchanged installation will not succeed.",
+      },
+    );
+    this.name = "WindowsNativeControlUnavailableError";
+  }
+}
+
+const WINDOWS_EXECUTABLE_SPAWN_CONSTRAINTS = new Set([
+  "Create process atomically inside owned Job Object failed",
+  "Owned Windows process requires an absolute executable path",
+]);
+
+const WINDOWS_CONTROL_SPAWN_CONSTRAINTS = [
+  "Wrong native process launch argument count",
+  "Job memory limit must be a positive safe integer",
+  "Job memory limit must be a whole number of pages",
+  "Create owned Job Object failed",
+  "Apply kill-on-owner-close Job Object policy failed",
+  "Read Job Object policy failed",
+  "Job Object policy permits unexpected breakaway",
+  "Job Object memory limit was not applied exactly",
+  "Create owned Job Object notification port failed",
+  "Associate owned Job Object notification port failed",
+  "Create owned process output pipe failed",
+  "Protect parent process pipe handle inheritance failed",
+  "Open owned process null input failed",
+  "Initialize process attributes failed",
+  "Windows atomic process attribute is unavailable",
+  "Invalid child environment name",
+  "Empty child environment entry",
+  "Compare Windows environment names failed",
+  "Open suspended process default-owner token failed",
+  "Read suspended process user identity failed",
+  "Set suspended process file owner failed",
+  "Read caller process affinity failed",
+  "Preserve caller process affinity failed",
+  "Caller CPU affinity cannot bound an owned process in another processor group",
+  "Preserve caller process priority failed",
+  "Suspended process has no owned Job Object membership",
+  "Resume job-owned process failed",
+] as const;
+
+const WINDOWS_SPAWN_CONTROL_REMEDIATION =
+  "Inspect the preserved Windows native process launch control error. Ensure the host permits owned Job Object assignment, token normalization, pipe inheritance, and caller CPU affinity/priority preservation across processor groups, then retry.";
+
+/** A required host or Job Object control was rejected during native process_spawn. */
+export class WindowsNativeSpawnControlError extends RuntimeControlUnavailableError {
+  readonly code = "windows-native-spawn-control-unavailable";
+  readonly constraint: string | undefined;
+  readonly win32Code: number | undefined;
+
+  constructor(cause: unknown, message?: string) {
+    const constraint =
+      cause instanceof Error &&
+      typeof Reflect.get(cause, "constraint") === "string"
+        ? Reflect.get(cause, "constraint")
+        : undefined;
+    const win32Code =
+      cause instanceof Error &&
+      typeof Reflect.get(cause, "win32Code") === "number"
+        ? Reflect.get(cause, "win32Code")
+        : undefined;
+    super(message ?? (cause instanceof Error ? cause.message : String(cause)), {
+      cause,
+      retryable: true,
+      remediationAction: WINDOWS_SPAWN_CONTROL_REMEDIATION,
+    });
+    this.name = "WindowsNativeSpawnControlError";
+    this.constraint = constraint;
+    this.win32Code = win32Code;
+  }
+}
+
+/** Distinguish target executable launch failures from native host-control rejections in process_spawn. */
+export const isWindowsExecutableLaunchFailure = (cause: unknown): boolean => {
+  if (!(cause instanceof Error)) return false;
+  const constraint = Reflect.get(cause, "constraint");
+  if (typeof constraint === "string" && constraint.length > 0) {
+    return WINDOWS_EXECUTABLE_SPAWN_CONSTRAINTS.has(constraint);
+  }
+  if (
+    [...WINDOWS_EXECUTABLE_SPAWN_CONSTRAINTS].some((prefix) =>
+      cause.message.startsWith(prefix),
+    )
+  ) {
+    return true;
+  }
+  if (
+    WINDOWS_CONTROL_SPAWN_CONSTRAINTS.some((prefix) =>
+      cause.message.startsWith(prefix),
+    )
+  ) {
+    return false;
+  }
+  const code = Reflect.get(cause, "code");
+  return typeof code === "string" && code !== "ERR_REA_WINDOWS_NATIVE";
+};
+
+/** Wrap a raw native process_spawn host-control rejection as a RuntimeControlUnavailableError. */
+export const windowsNativeSpawnControlError = (
+  cause: unknown,
+): WindowsNativeSpawnControlError | undefined => {
+  if (cause instanceof WindowsNativeSpawnControlError) return cause;
+  if (!(cause instanceof Error)) return undefined;
+  const constraint = Reflect.get(cause, "constraint");
+  if (typeof constraint === "string" && constraint.length > 0) {
+    return WINDOWS_EXECUTABLE_SPAWN_CONSTRAINTS.has(constraint)
+      ? undefined
+      : new WindowsNativeSpawnControlError(cause);
+  }
+  if (
+    WINDOWS_CONTROL_SPAWN_CONSTRAINTS.some((prefix) =>
+      cause.message.startsWith(prefix),
+    )
+  ) {
+    return new WindowsNativeSpawnControlError(cause);
+  }
+  return undefined;
+};
+
 /** Encode one ordinary Windows argv token using the CRT backslash rules. */
 export const quoteWindowsProcessArgument = (value: string): string => {
   if (value.includes("\0"))
     throw new TypeError("Windows process argument contains NUL");
   return `"${value.replace(/(\\*)"/gu, '$1$1\\"').replace(/(\\+)$/u, "$1$1")}"`;
 };
+
+// Back off after a failed native poll instead of retrying at the idle cadence.
+const POLL_RETRY_MS = 250;
 
 /** Process events and streams backed by a retained native Job Object. */
 export class WindowsOwnedProcess extends EventEmitter {
@@ -65,12 +202,20 @@ export class WindowsOwnedProcess extends EventEmitter {
   readonly #settled: Promise<void>;
   #settle: (() => void) | undefined;
   #closed = false;
+  // Settlement was observed and stream teardown finished, but process_close
+  // has not released every native handle. Later cleanup retries that close
+  // alone; kill and poll still need the job or process handle.
+  #releasePending = false;
   #failure: string | undefined;
   #timer: NodeJS.Timeout | undefined;
+  #blockedWake: NodeJS.Timeout | undefined;
+  readonly #blockedOutput = new Set<PassThrough>();
+  #unreferenced = false;
   #cleanup: Promise<ProcessCleanupResult> | undefined;
   readonly #memoryLimitBytes: number | undefined;
   #memoryLimitReached = false;
   #peakJobMemoryBytes: number | undefined;
+  #outputIncomplete = false;
 
   constructor(
     command: string,
@@ -85,18 +230,14 @@ export class WindowsOwnedProcess extends EventEmitter {
     this.#memoryLimitBytes = options.memoryLimitBytes;
     this.#authority = options.authority ?? requireWindowsNativeAuthority();
     if (protocolStdin && this.#authority.inspection.protocolStdin !== true)
-      throw new Error(
-        "The bundled Windows native artifact does not support owned protocol stdin; use a matching current Windows x64 REA package.",
-      );
+      throw new WindowsNativeControlUnavailableError("protocol-stdin");
     // A requested limit is never dropped: an artifact without the control
     // refuses the launch instead of starting an unlimited process.
     if (
       this.#memoryLimitBytes !== undefined &&
       this.#authority.inspection.jobMemoryLimit !== true
     )
-      throw new Error(
-        "The bundled Windows native artifact does not support Job Object memory limits; use a matching current Windows x64 REA package.",
-      );
+      throw new WindowsNativeControlUnavailableError("job-memory-limit");
     const entries = Object.entries(environment)
       .filter((entry): entry is [string, string] => entry[1] !== undefined)
       .map(([key, value]) => `${key}=${value}`);
@@ -113,19 +254,35 @@ export class WindowsOwnedProcess extends EventEmitter {
     let controls: unknown[] = protocolStdin ? [true] : [];
     if (this.#memoryLimitBytes !== undefined)
       controls = [protocolStdin, this.#memoryLimitBytes];
-    const spawned = this.#authority.call("process_spawn", [
-      command,
-      line,
-      cwd ?? "",
-      entries,
-      ...controls,
-    ]);
-    const launched =
-      this.#memoryLimitBytes === undefined
-        ? launchSchema.parse(spawned)
-        : launchSchema
-            .extend({ jobMemoryLimitBytes: z.literal(this.#memoryLimitBytes) })
-            .parse(spawned);
+    let spawned: unknown;
+    try {
+      spawned = this.#authority.call("process_spawn", [
+        command,
+        line,
+        cwd ?? "",
+        entries,
+        ...controls,
+      ]);
+    } catch (cause: unknown) {
+      if (isWindowsExecutableLaunchFailure(cause)) throw cause;
+      throw new WindowsNativeSpawnControlError(cause);
+    }
+    let launched: z.infer<typeof launchSchema>;
+    try {
+      launched =
+        this.#memoryLimitBytes === undefined
+          ? launchSchema.parse(spawned)
+          : launchSchema
+              .extend({
+                jobMemoryLimitBytes: z.literal(this.#memoryLimitBytes),
+              })
+              .parse(spawned);
+    } catch (cause: unknown) {
+      throw new WindowsNativeSpawnControlError(
+        cause,
+        "Windows native process launch did not confirm required Job Object controls.",
+      );
+    }
     this.pid = launched.pid;
     this.#handle = launched.handle;
     this.stdin = protocolStdin
@@ -178,10 +335,14 @@ export class WindowsOwnedProcess extends EventEmitter {
     return this.#peakJobMemoryBytes;
   }
 
+  /** True when cleanup destroyed a backpressured stream before all output was observed. */
+  get outputIncomplete(): boolean {
+    return this.#outputIncomplete;
+  }
+
   async #writeInput(chunk: unknown): Promise<void> {
     const bytes = z.instanceof(Buffer).parse(chunk);
     const written = z
-      .number()
       .int()
       .nonnegative()
       .max(Number.MAX_SAFE_INTEGER)
@@ -222,11 +383,37 @@ export class WindowsOwnedProcess extends EventEmitter {
     return this.#cleanup;
   }
 
+  /** Release event-loop references so unsettled jobs do not prevent host exit. */
+  unref(): void {
+    this.#unreferenced = true;
+    this.#timer?.unref();
+    this.#blockedWake?.unref();
+  }
+
+  /** Restore event-loop references when retrying process lifecycle observation. */
+  ref(): void {
+    this.#unreferenced = false;
+    this.#timer?.ref();
+    this.#blockedWake?.ref();
+  }
+
   async #stop(): Promise<ProcessCleanupResult> {
     if (this.#closed) return { cleaned: true, signaled: false };
+    if (this.#releasePending) {
+      try {
+        this.#release();
+        return { cleaned: true, signaled: false };
+      } catch (cause: unknown) {
+        return {
+          cleaned: false,
+          reason: cause instanceof Error ? cause.message : String(cause),
+        };
+      }
+    }
     let timer: NodeJS.Timeout | undefined;
     try {
       const signaled = this.kill();
+      this.#discardBlockedOutput();
       this.#schedule();
       const settled = await Promise.race([
         this.#settled.then(() => true),
@@ -252,14 +439,64 @@ export class WindowsOwnedProcess extends EventEmitter {
     }
   }
 
-  #schedule(): void {
-    if (this.#closed || this.#timer !== undefined) return;
-    this.#timer = setTimeout(() => this.#poll(), 25);
+  #schedule(delay = 25): void {
+    if (
+      this.#closed ||
+      this.#timer !== undefined ||
+      this.#blockedOutput.size > 0
+    )
+      return;
+    this.#timer = setTimeout(() => this.#poll(), delay);
+    if (this.#unreferenced) this.#timer.unref();
+  }
+
+  #scheduleBlockedWake(): void {
+    if (
+      this.#closed ||
+      this.#blockedOutput.size === 0 ||
+      this.#blockedWake !== undefined
+    )
+      return;
+    this.#blockedWake = setTimeout(() => {
+      this.#blockedWake = undefined;
+      this.#scheduleBlockedWake();
+    }, 1_000);
+    if (this.#unreferenced) this.#blockedWake.unref();
+  }
+
+  #clearBlockedWake(): void {
+    if (this.#blockedWake !== undefined) clearTimeout(this.#blockedWake);
+    this.#blockedWake = undefined;
+  }
+
+  #unblockOutput(stream: PassThrough): void {
+    if (stream.destroyed) this.#outputIncomplete = true;
+    this.#blockedOutput.delete(stream);
+    if (this.#blockedOutput.size === 0) this.#clearBlockedWake();
+    this.#schedule(0);
+  }
+
+  #discardBlockedOutput(): void {
+    if (this.#blockedOutput.size > 0) this.#outputIncomplete = true;
+    for (const stream of this.#blockedOutput) stream.destroy();
+    this.#blockedOutput.clear();
+    this.#clearBlockedWake();
   }
 
   #poll(): void {
     this.#timer = undefined;
     if (this.#closed) return;
+    if (this.#releasePending) {
+      try {
+        this.#release();
+      } catch (cause: unknown) {
+        const failure =
+          cause instanceof Error ? cause : new Error(String(cause));
+        this.#failure = failure.message;
+        if (this.listenerCount("error") > 0) this.emit("error", failure);
+      }
+      return;
+    }
     try {
       const observed: unknown = this.#authority.call("process_poll", [
         this.#handle,
@@ -275,8 +512,11 @@ export class WindowsOwnedProcess extends EventEmitter {
         state = limited;
       }
       this.#failure = undefined;
-      if (state.stdout.length > 0) this.stdout.write(state.stdout);
-      if (state.stderr.length > 0) this.stderr.write(state.stderr);
+      // Stop native reads while either consumer is backpressured. A slower
+      // cadence still accumulates unbounded unread output in the parent heap.
+      const idle = state.stdout.length === 0 && state.stderr.length === 0;
+      this.#writeOutput(this.stdout, state.stdout);
+      this.#writeOutput(this.stderr, state.stderr);
       if (state.exitCode !== null && this.exitCode === null) {
         this.exitCode = state.exitCode;
         this.emit("exit", state.exitCode, null);
@@ -288,25 +528,57 @@ export class WindowsOwnedProcess extends EventEmitter {
         state.activeProcesses === 0
       ) {
         this.#release();
-      } else this.#schedule();
+      } else this.#schedule(idle ? 25 : 0);
     } catch (cause: unknown) {
       const failure = cause instanceof Error ? cause : new Error(String(cause));
+      const repeated = this.#failure !== undefined;
       this.#failure = failure.message;
       // Native lifecycle failures belong to the error/cleanup channels, never
-      // the captured stderr observation produced by the child itself.
-      if (this.listenerCount("error") > 0) this.emit("error", failure);
-      // Retain the original job so explicit cleanup can retry its observation.
+      // the captured stderr observation produced by the child itself. A run of
+      // consecutive failures is reported once.
+      if (!repeated && this.listenerCount("error") > 0)
+        this.emit("error", failure);
+      // Poll failures keep the job for another observation. Without one, a
+      // single failed poll would stop output and exit delivery for the rest of
+      // the process lifetime. A process_close failure leaves #releasePending so
+      // cleanup retries that close alone.
+      this.#schedule(POLL_RETRY_MS);
     }
+  }
+
+  #writeOutput(stream: PassThrough, bytes: Buffer): void {
+    if (bytes.length === 0 || stream.writableEnded) return;
+    if (stream.destroyed) {
+      this.#outputIncomplete = true;
+      return;
+    }
+    if (stream.write(bytes)) return;
+    this.#blockedOutput.add(stream);
+    const unblock = () => {
+      stream.off("drain", unblock);
+      stream.off("close", unblock);
+      this.#unblockOutput(stream);
+    };
+    stream.once("drain", unblock);
+    stream.once("close", unblock);
+    this.#scheduleBlockedWake();
   }
 
   #release(): void {
     if (this.#closed) return;
-    if (this.#timer !== undefined) clearTimeout(this.#timer);
+    if (!this.#releasePending) {
+      if (this.#timer !== undefined) clearTimeout(this.#timer);
+      this.#timer = undefined;
+      this.#clearBlockedWake();
+      this.stdin?.destroy();
+      if (!this.stdout.destroyed) this.stdout.end();
+      if (!this.stderr.destroyed) this.stderr.end();
+      this.#releasePending = true;
+    }
+    // Streams are already ended. A failed close retries this call alone.
     this.#authority.call("process_close", [this.#handle]);
+    this.#releasePending = false;
     this.#closed = true;
-    this.stdin?.destroy();
-    this.stdout.end();
-    this.stderr.end();
     this.#settle?.();
     this.emit("close", this.exitCode, null);
   }

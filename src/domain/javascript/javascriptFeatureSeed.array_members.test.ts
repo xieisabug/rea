@@ -11,8 +11,11 @@ import {
 } from "./javascriptApplicationGraph.fixture.js";
 import { findApplicationFeatureSeeds } from "./javascriptFeatureSeed.js";
 import { traceApplicationFeature } from "./javascriptFeatureTrace.js";
-import type { ApplicationFeatureSeed } from "./javascriptFeatureTraceSchemas.js";
-import { analyzeJavaScriptStaticSource } from "./javascriptStaticAnalysis.js";
+import {
+  applicationFeatureSeedSchema,
+  type ApplicationFeatureSeed,
+} from "./javascriptFeatureTraceSchemas.js";
+import { analyzeCommonJsStaticFixture } from "../../../tests/fixtures/javascriptCommonJsAnalysis.js";
 import type { JsonValue } from "../jsonValue.js";
 
 const memberFields = [
@@ -162,7 +165,6 @@ describe("feature seed selection controls", () => {
     { kind: "module", nodeKind: "javascript-module", field: "original_source" },
     { kind: "native-export", nodeKind: "native-export", field: "label" },
     { kind: "native-export", nodeKind: "native-export", field: "key" },
-    { kind: "route", nodeKind: "endpoint", field: "label" },
     { kind: "route", nodeKind: "endpoint", field: "value" },
     { kind: "route", nodeKind: "endpoint", field: "path" },
     { kind: "channel", nodeKind: "ipc-channel", field: "label" },
@@ -188,6 +190,30 @@ describe("feature seed selection controls", () => {
       ]);
     },
   );
+
+  it("excludes route labels while preserving generic scalar and array matching", () => {
+    const scalar = memberNode("endpoint", {
+      endpoint_kind: "route",
+      label: "route endpoint",
+    });
+    const array = memberNode("endpoint", {
+      endpoint_kind: "route",
+      label: ["route endpoint"],
+    });
+
+    expect(
+      findApplicationFeatureSeeds([scalar], seed("route", "route endpoint")),
+    ).toEqual([]);
+    expect(
+      findApplicationFeatureSeeds([array], seed("route", "route endpoint")),
+    ).toEqual([]);
+    expect(
+      findApplicationFeatureSeeds([scalar], seed("string", "route endpoint")),
+    ).toEqual([propertyMatch(scalar, "label")]);
+    expect(
+      findApplicationFeatureSeeds([array], seed("string", "route endpoint")),
+    ).toEqual([propertyMatch(array, "label[0]")]);
+  });
 
   it("keeps generic matching and scalar label and identity selection", () => {
     const node = memberNode("context-bridge-api", { members: ["openProject"] });
@@ -267,8 +293,8 @@ describe("feature seed selection controls", () => {
   );
 });
 
-describe("public feature trace from contextBridge source members", () => {
-  it("traces one exact member seed through the public feature workflow", () => {
+describe("feature trace projection from contextBridge source members", () => {
+  it("traces one exact member seed while preserving projection facts", () => {
     const mode = {
       value: "openProject",
       match: "exact" as const,
@@ -338,8 +364,10 @@ describe("public feature trace from contextBridge source members", () => {
       total_seed_matches: 0,
     });
     expect(result.evidence_links).toEqual([sourceEvidenceId]);
-    expect(result.limitations).toContain(
-      "No graph entity matched the literal seed; this is not evidence that the feature is absent.",
+    expect(result.limitations).toContainEqual(
+      expect.stringMatching(
+        /no application graph entity matched.*not evidence.*feature is absent/iu,
+      ),
     );
   });
 
@@ -370,8 +398,10 @@ describe("public feature trace from contextBridge source members", () => {
     });
     expect(result.graph?.coverage).toEqual(partialGraph.coverage);
     expect(result.graph?.nodes).toEqual(partialGraph.nodes);
-    expect(result.limitations).toContain(
-      "The source application graph is incomplete; unmatched seeds and frontiers remain unknown.",
+    expect(result.limitations).toContainEqual(
+      expect.stringMatching(
+        /source application graph.*incomplete.*unmatched seeds and frontiers.*unknown/iu,
+      ),
     );
   });
 });
@@ -381,12 +411,13 @@ const sourceEvidenceId = `ev_${"b".repeat(64)}`;
 const seed = (
   kind: ApplicationFeatureSeed["kind"],
   value = "openProject",
-): ApplicationFeatureSeed => ({
-  kind,
-  value,
-  match: "exact",
-  case_sensitive: true,
-});
+): ApplicationFeatureSeed =>
+  applicationFeatureSeedSchema.parse({
+    kind,
+    value,
+    match: "exact",
+    case_sensitive: true,
+  });
 
 const memberNode = (
   kind: ApplicationNode["kind"],
@@ -424,7 +455,7 @@ const propertyMatch = (node: ApplicationNode, field: string) => ({
 });
 
 const contextBridgeGraph = () => {
-  const analysis = analyzeJavaScriptStaticSource(
+  const analysis = analyzeCommonJsStaticFixture(
     "const { contextBridge } = require('electron');\ncontextBridge.exposeInMainWorld('desktopApi', { openProject() {}, closeProject() {} });",
   );
   expect(analysis.parse_status).toBe("complete");

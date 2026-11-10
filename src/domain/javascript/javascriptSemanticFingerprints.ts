@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import * as t from "@babel/types";
+import { runtimeFunctionParameters } from "./javascriptAstValues.js";
 
 import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import type { JavaScriptSemanticCallAnalysis } from "./javascriptSemanticCalls.js";
@@ -82,10 +83,25 @@ export function* collectJavaScriptSemanticFingerprintsSteps(
     const networkEffects = networkEffectsByOwner.get(callable.callableId) ?? [];
     const resourceEffects =
       resourceEffectsByOwner.get(callable.callableId) ?? [];
+    const conditionalBuiltinEffects =
+      timerEffects.some(
+        ({ builtinAuthority }) => builtinAuthority === "candidate",
+      ) ||
+      childProcessEffects.some(
+        ({ builtinAuthority }) => builtinAuthority === "candidate",
+      ) ||
+      networkEffects.some(
+        ({ builtinAuthority }) => builtinAuthority === "candidate",
+      ) ||
+      resourceEffects.some(
+        ({ builtinAuthority }) => builtinAuthority === "candidate",
+      );
     fingerprints.push({
       callableId: callable.callableId,
       status:
-        parserPartial || callable.returnCoverage.status !== "complete"
+        parserPartial ||
+        conditionalBuiltinEffects ||
+        callable.returnCoverage.status !== "complete"
           ? "partial"
           : "complete",
       components: {
@@ -119,6 +135,11 @@ export function* collectJavaScriptSemanticFingerprintsSteps(
         "The fingerprint is a static candidate and does not prove behavioral equivalence.",
         ...(parserPartial
           ? ["Incomplete semantic recovery makes this fingerprint partial."]
+          : []),
+        ...(conditionalBuiltinEffects
+          ? [
+              "A built-in effect has conditional loader or mutation identity, so its fingerprint contribution is partial.",
+            ]
           : []),
       ],
     });
@@ -197,6 +218,8 @@ const normalizedNodeToken = (node: t.Node, parent: t.Node | null): string => {
     primitiveAttribute(node, "optional"),
     primitiveAttribute(node, "async"),
     primitiveAttribute(node, "generator"),
+    primitiveAttribute(node, "delegate"),
+    primitiveAttribute(node, "prefix"),
   ].filter((value): value is string => value !== null);
   return [node.type, ...attributes].join(":");
 };
@@ -249,6 +272,9 @@ const controlFlowToken = (node: t.Node): string | null => {
 };
 
 const semanticLiteral = (node: t.Node): string | null => {
+  // Babel retains directive escapes in value; decoding them would erase the
+  // distinction between a strict-mode directive and an escaped lookalike.
+  if (t.isDirectiveLiteral(node)) return `directive:${node.value}`;
   if (t.isStringLiteral(node)) return `string:${node.value}`;
   if (t.isNumericLiteral(node)) return `number:${String(node.value)}`;
   if (t.isBooleanLiteral(node)) return `boolean:${String(node.value)}`;
@@ -279,7 +305,7 @@ const relationShape = (
 ];
 
 const callableParameterArity = (node: t.Node): number =>
-  t.isFunction(node) ? node.params.length : 0;
+  t.isFunction(node) ? runtimeFunctionParameters(node).length : 0;
 
 const isAsyncCallable = (node: t.Node): boolean =>
   t.isFunction(node) && node.async;
